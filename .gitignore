@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Benchmark / debug output
+bench_out/
+*.png
+!docs/**/*.png
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
