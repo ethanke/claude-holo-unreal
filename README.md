@@ -84,7 +84,8 @@ That's it. `hue claude` installs the two shipped skills into `~/.claude/skills/`
 Idempotent — safe to run repeatedly. Use `--force` to reinstall skills and re-register the MCP server.
 
 ```bash
-hue claude                     # bootstrap + launch
+hue                            # bare `hue` is aliased to `hue claude` — true one-command start
+hue claude                     # explicit form
 hue claude -- --continue       # pass args through to `claude`
 hue claude --force             # reinstall skills, re-register MCP, then launch
 hue claude --no-mcp            # skip MCP registration step

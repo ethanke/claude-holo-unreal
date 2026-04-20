@@ -687,6 +687,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    # Bare `hue` / `python -m holo_unreal` → one-shot bootstrap + launch.
+    if not argv:
+        argv = ["claude"]
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
