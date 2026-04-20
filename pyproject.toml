@@ -1,0 +1,73 @@
+[project]
+name = "claude-holo-unreal"
+version = "0.2.0"
+description = "Unreal Engine copilot for Claude Code — UE toolkit CLI + Holo3 vision clicker, packaged as a CLI, MCP server, Claude Code skills, and Python library."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Ethan Kerdelhue" }]
+keywords = [
+    "unreal-engine",
+    "claude-code",
+    "mcp",
+    "holo3",
+    "hcompany",
+    "vision-language-model",
+    "llm-agent",
+    "automation",
+    "gamedev",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Games/Entertainment",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "openai>=1.40",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0",
+]
+focus = [
+    "pywin32>=306",
+    "pyautogui>=0.9.54",
+    "psutil>=5.9",
+]
+all = [
+    "mcp>=1.0",
+    "pywin32>=306",
+    "pyautogui>=0.9.54",
+    "psutil>=5.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/ethanke/claude-holo-unreal"
+Repository = "https://github.com/ethanke/claude-holo-unreal"
+Issues = "https://github.com/ethanke/claude-holo-unreal/issues"
+
+[project.scripts]
+holo-unreal = "holo_unreal.cli:main"
+hue = "holo_unreal.cli:main"
+holo-unreal-mcp = "holo_unreal.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["holo_unreal*"]
+
+[tool.setuptools.package-data]
+holo_unreal = ["py.typed"]

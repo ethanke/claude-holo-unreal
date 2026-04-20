@@ -1,2 +1,12 @@
-openai>=1.93.0
+# Pinned runtime deps for users who can't install via `pip install -e .`.
+# Prefer: pip install -e .[all]  (uses pyproject.toml).
+openai>=1.40
 pillow>=10.0
+
+# Optional: MCP server
+mcp>=1.0
+
+# Optional: reliable focus / process detection (needed for `hue focus`).
+pywin32>=306
+pyautogui>=0.9.54
+psutil>=5.9

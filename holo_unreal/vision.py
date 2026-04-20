@@ -1,26 +1,26 @@
-"""Holo3 → Unreal Engine viewport click agent.
+"""Holo3 vision grounding + Win32 input primitives for Unreal Editor.
 
-Screenshots the Unreal Editor window, asks Holo3-35B-A3B (H Company's vision
-model) where the described element is, then synthesizes a click at the returned
-pixel. Pure Win32 ctypes — no pywin32 or pyautogui dependency.
+Screenshots the target UE window, asks Holo3-35B-A3B (H Company) where the
+described element is, then synthesizes a click at the returned pixel.
 
-CLI usage:
-    python holo3_ue.py "the Blueprint menu in the toolbar"
-    python holo3_ue.py "the play button" --dry-run
-    python holo3_ue.py "Save" --window-title "MyProject" --save debug.png
-    python holo3_ue.py --list-windows
-    python holo3_ue.py --press "ctrl+s"                     # keyboard chord
-    python holo3_ue.py "the search box" --type "HelloWorld" # click + type
+Pure `ctypes` underneath — no `pywin32`, no `pyautogui`, no Selenium. Runtime
+dependencies: `openai` (managed API client) and `Pillow` (screenshot grab).
+
+All `*_by_description` helpers target the window whose title case-insensitively
+matches `window_title` (default "Unreal Editor" — overridable per-call or via
+the `HOLO_UNREAL_WINDOW_TITLE` env var).
 
 Library usage:
-    from holo3_ue import click_by_description, localize_in_window, type_into
+    from holo_unreal import (
+        click_by_description, localize_in_window, type_into, press_key,
+    )
     click_by_description("the Play button")
-    x, y, screen_x, screen_y = localize_in_window("Save")
-    type_into("the search box", "HelloWorld")
+    x, y, sx, sy = localize_in_window("Save All")   # dry-run coords
+    type_into("the search box", "MyActor")
+    press_key("s", modifiers=["ctrl"])
 """
 from __future__ import annotations
 
-import argparse
 import base64
 import ctypes
 import io
@@ -29,14 +29,23 @@ import os
 import sys
 import time
 from ctypes import wintypes
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from openai import OpenAI
 from PIL import Image, ImageGrab
 
-DEFAULT_BASE_URL = "https://api.hcompany.ai/v1/"
-DEFAULT_MODEL = "holo3-35b-a3b"
-DEFAULT_WINDOW_TITLE = "Unreal Editor"
+from ._env import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DEFAULT_WINDOW_TITLE,
+    default_window_title,
+    hai_api_key,
+    hai_base_url,
+    hai_model,
+    load_env,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    from openai import OpenAI
 
 LOCALIZE_SCHEMA = {
     "type": "object",
@@ -49,36 +58,51 @@ LOCALIZE_SCHEMA = {
 }
 
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
+# ---------------------------------------------------------------------- Win32
 
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-user32.EnumWindows.restype = wintypes.BOOL
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsWindowVisible.restype = wintypes.BOOL
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-user32.GetWindowRect.restype = wintypes.BOOL
-user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-user32.SetForegroundWindow.restype = wintypes.BOOL
-user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-user32.SetCursorPos.restype = wintypes.BOOL
+if sys.platform == "win32":
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = wintypes.BOOL
+    user32.mouse_event.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    ]
+    user32.mouse_event.restype = None
+
+    # Make the process DPI-aware so coordinates match physical pixels.
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+else:
+    user32 = None  # type: ignore[assignment]
+    WNDENUMPROC = None  # type: ignore[assignment]
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
-user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
-user32.mouse_event.restype = None
 
-# SendInput plumbing (keyboard) ----------------------------------------------
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
-KEYEVENTF_SCANCODE = 0x0008
 KEYEVENTF_EXTENDEDKEY = 0x0001
 
 ULONG_PTR = ctypes.c_size_t
@@ -121,13 +145,17 @@ class _INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
 
 
-user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
-user32.SendInput.restype = wintypes.UINT
+if sys.platform == "win32":
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+
 
 # Virtual-key code table. Extended keys need KEYEVENTF_EXTENDEDKEY.
-_EXTENDED_VK = {0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x5B, 0x5C}
+_EXTENDED_VK = {
+    0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x5B, 0x5C,
+}
 _MOD_VK = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B}
-_NAMED_VK = {
+_NAMED_VK: dict[str, int] = {
     "enter": 0x0D, "return": 0x0D,
     "tab": 0x09,
     "escape": 0x1B, "esc": 0x1B,
@@ -142,7 +170,7 @@ _NAMED_VK = {
 }
 for _i in range(1, 13):
     _NAMED_VK[f"f{_i}"] = 0x6F + _i  # F1 = 0x70 ... F12 = 0x7B
-_NAMED_VK["f13"] = 0x7C  # safe no-binding key used by CLI smoke test
+_NAMED_VK["f13"] = 0x7C
 
 
 def _vk_for(key: str) -> int:
@@ -167,7 +195,7 @@ def _send_vk(vk: int, key_up: bool = False) -> None:
 
 def _send_unicode_char(ch: str) -> None:
     code = ord(ch)
-    # Surrogate pair handling for chars outside the BMP
+    # Surrogate pair handling for chars outside the BMP.
     if code > 0xFFFF:
         high = 0xD800 + ((code - 0x10000) >> 10)
         low = 0xDC00 + ((code - 0x10000) & 0x3FF)
@@ -191,7 +219,13 @@ def _send_unicode_char(ch: str) -> None:
         user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
+# --------------------------------------------------------- window discovery
+
 def list_windows() -> list[tuple[int, str]]:
+    """Enumerate visible top-level windows. Returns [(hwnd, title), ...]."""
+    if sys.platform != "win32":
+        raise RuntimeError("list_windows() is Windows-only")
+
     results: list[tuple[int, str]] = []
 
     @WNDENUMPROC
@@ -215,7 +249,10 @@ def find_window(title_substr: str) -> tuple[int, str]:
     for hwnd, title in list_windows():
         if needle in title.lower():
             return hwnd, title
-    raise SystemExit(f"no visible window matched '{title_substr}'. Try --list-windows.")
+    raise RuntimeError(
+        f"no visible window matched {title_substr!r}. "
+        f"Try `hue list-windows` to see options."
+    )
 
 
 def get_rect(hwnd: int) -> tuple[int, int, int, int]:
@@ -226,6 +263,7 @@ def get_rect(hwnd: int) -> tuple[int, int, int, int]:
 
 
 def capture(hwnd: int) -> tuple[Image.Image, tuple[int, int]]:
+    """Foreground + screenshot the window. Returns (image, (left, top))."""
     user32.SetForegroundWindow(hwnd)
     time.sleep(0.15)
     left, top, right, bottom = get_rect(hwnd)
@@ -233,7 +271,31 @@ def capture(hwnd: int) -> tuple[Image.Image, tuple[int, int]]:
     return img, (left, top)
 
 
-def localize(client: OpenAI, model: str, image: Image.Image, description: str, temperature: float = 0.0) -> tuple[int, int]:
+# ----------------------------------------------------------- OpenAI client
+
+def _make_client(base_url: str | None = None, api_key: str | None = None) -> "OpenAI":
+    from openai import OpenAI
+
+    load_env()
+    url = base_url or hai_base_url()
+    key = api_key or hai_api_key()
+    if not key:
+        raise RuntimeError(
+            "HAI_API_KEY not set. Put it in .env, export it, or pass api_key=...."
+        )
+    return OpenAI(base_url=url, api_key=key)
+
+
+# ------------------------------------------------------------ localization
+
+def localize(
+    client: "OpenAI",
+    model: str,
+    image: Image.Image,
+    description: str,
+    temperature: float = 0.0,
+) -> tuple[int, int]:
+    """Ask Holo3 where `description` is in `image`. Returns (x, y) in image px."""
     buf = io.BytesIO()
     image.convert("RGB").save(buf, format="JPEG", quality=90)
     b64 = base64.b64encode(buf.getvalue()).decode()
@@ -265,9 +327,13 @@ def localize(client: OpenAI, model: str, image: Image.Image, description: str, t
     parsed = json.loads(content)
     x, y = int(parsed["x"]), int(parsed["y"])
     if not (0 <= x < image.width and 0 <= y < image.height):
-        raise RuntimeError(f"coords {x},{y} out of bounds for {image.width}x{image.height}")
+        raise RuntimeError(
+            f"Holo3 coords {x},{y} out of bounds for {image.width}x{image.height}"
+        )
     return x, y
 
+
+# ------------------------------------------------------------------ input
 
 def click_at(screen_x: int, screen_y: int) -> None:
     user32.SetCursorPos(screen_x, screen_y)
@@ -278,7 +344,6 @@ def click_at(screen_x: int, screen_y: int) -> None:
 
 
 def right_click_at(screen_x: int, screen_y: int) -> None:
-    """Right-click at absolute screen pixel."""
     user32.SetCursorPos(screen_x, screen_y)
     time.sleep(0.05)
     user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, None)
@@ -287,14 +352,12 @@ def right_click_at(screen_x: int, screen_y: int) -> None:
 
 
 def double_click_at(screen_x: int, screen_y: int, interval: float = 0.08) -> None:
-    """Two left clicks separated by `interval` seconds."""
     click_at(screen_x, screen_y)
     time.sleep(interval)
     click_at(screen_x, screen_y)
 
 
 def send_text(text: str, per_char_delay: float = 0.01) -> None:
-    """Type Unicode text into the focused window via SendInput."""
     for ch in text:
         _send_unicode_char(ch)
         if per_char_delay > 0:
@@ -302,7 +365,6 @@ def send_text(text: str, per_char_delay: float = 0.01) -> None:
 
 
 def press_key(key: str, modifiers: list[str] | None = None) -> None:
-    """Press `key` with optional modifier chord (e.g. ["ctrl","shift"])."""
     mods = [m.lower().strip() for m in (modifiers or [])]
     for m in mods:
         if m not in _MOD_VK:
@@ -318,31 +380,33 @@ def press_key(key: str, modifiers: list[str] | None = None) -> None:
         _send_vk(mvk, key_up=True)
 
 
-def _make_client(base_url: str | None = None, api_key: str | None = None) -> OpenAI:
-    load_env()
-    url = base_url or os.environ.get("HAI_MODEL_URL", DEFAULT_BASE_URL)
-    key = api_key or os.environ.get("HAI_API_KEY")
-    if not key:
-        raise RuntimeError("HAI_API_KEY not set (env, .env, or api_key arg)")
-    return OpenAI(base_url=url, api_key=key)
+def press_chord(combo: str) -> None:
+    """Helper: parse `ctrl+shift+s` into press_key."""
+    parts = [p.strip() for p in combo.split("+") if p.strip()]
+    if not parts:
+        raise ValueError("empty key combo")
+    press_key(parts[-1], modifiers=parts[:-1] or None)
 
+
+# ------------------------------------------------------------ composition
 
 def localize_in_window(
     description: str,
     *,
-    window_title: str = DEFAULT_WINDOW_TITLE,
+    window_title: str | None = None,
     model: str | None = None,
-    client: OpenAI | None = None,
+    client: "OpenAI | None" = None,
     temperature: float = 0.0,
 ) -> tuple[int, int, int, int]:
-    """Screenshot UE window, ask Holo3 where the element is.
+    """Screenshot the UE window, ask Holo3 where the element is.
 
     Returns (window_x, window_y, screen_x, screen_y). Does not click.
     """
-    hwnd, _ = find_window(window_title)
+    title = window_title or default_window_title()
+    hwnd, _ = find_window(title)
     image, (win_left, win_top) = capture(hwnd)
     c = client or _make_client()
-    m = model or os.environ.get("HAI_MODEL_NAME", DEFAULT_MODEL)
+    m = model or hai_model()
     x, y = localize(c, m, image, description, temperature)
     return x, y, win_left + x, win_top + y
 
@@ -350,20 +414,20 @@ def localize_in_window(
 def click_by_description(
     description: str,
     *,
-    window_title: str = DEFAULT_WINDOW_TITLE,
+    window_title: str | None = None,
     model: str | None = None,
-    client: OpenAI | None = None,
+    client: "OpenAI | None" = None,
     temperature: float = 0.0,
     dry_run: bool = False,
     settle_seconds: float = 0.0,
 ) -> tuple[int, int]:
-    """Compose capture + localize + click. Returns (screen_x, screen_y).
-
-    Set dry_run=True to skip the click. settle_seconds pauses before clicking
-    (useful if you want to Ctrl+C between localize and click during tuning).
-    """
+    """Capture → localize → click. Returns (screen_x, screen_y)."""
     _, _, sx, sy = localize_in_window(
-        description, window_title=window_title, model=model, client=client, temperature=temperature
+        description,
+        window_title=window_title,
+        model=model,
+        client=client,
+        temperature=temperature,
     )
     if dry_run:
         return sx, sy
@@ -376,11 +440,10 @@ def click_by_description(
 def right_click_by_description(
     description: str,
     *,
-    window_title: str = DEFAULT_WINDOW_TITLE,
+    window_title: str | None = None,
     settle_seconds: float = 0.0,
     **kw,
 ) -> tuple[int, int]:
-    """Like click_by_description but synthesizes a right-click."""
     dry_run = kw.pop("dry_run", False)
     _, _, sx, sy = localize_in_window(description, window_title=window_title, **kw)
     if dry_run:
@@ -391,11 +454,28 @@ def right_click_by_description(
     return sx, sy
 
 
+def double_click_by_description(
+    description: str,
+    *,
+    window_title: str | None = None,
+    settle_seconds: float = 0.0,
+    **kw,
+) -> tuple[int, int]:
+    dry_run = kw.pop("dry_run", False)
+    _, _, sx, sy = localize_in_window(description, window_title=window_title, **kw)
+    if dry_run:
+        return sx, sy
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+    double_click_at(sx, sy)
+    return sx, sy
+
+
 def type_into(
     description: str,
     text: str,
     *,
-    window_title: str = DEFAULT_WINDOW_TITLE,
+    window_title: str | None = None,
     settle_seconds: float = 0.1,
     **kw,
 ) -> tuple[int, int]:
@@ -412,131 +492,24 @@ def type_into(
 
 
 __all__ = [
-    "list_windows",
-    "find_window",
-    "capture",
-    "localize",
-    "click_at",
-    "right_click_at",
-    "double_click_at",
-    "send_text",
-    "press_key",
-    "localize_in_window",
-    "click_by_description",
-    "right_click_by_description",
-    "type_into",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "DEFAULT_WINDOW_TITLE",
+    "LOCALIZE_SCHEMA",
+    "capture",
+    "click_at",
+    "click_by_description",
+    "double_click_at",
+    "double_click_by_description",
+    "find_window",
+    "get_rect",
+    "list_windows",
+    "localize",
+    "localize_in_window",
+    "press_chord",
+    "press_key",
+    "right_click_at",
+    "right_click_by_description",
+    "send_text",
+    "type_into",
 ]
-
-
-def load_env() -> None:
-    env_path = Path(__file__).with_name(".env")
-    if not env_path.exists():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip())
-
-
-def main() -> int:
-    load_env()
-    p = argparse.ArgumentParser(description="Holo3-powered viewport clicker for Unreal Engine.")
-    p.add_argument("description", nargs="?", help="what to find, e.g. 'the Play button'")
-    p.add_argument("--window-title", default=DEFAULT_WINDOW_TITLE, help="substring of UE window title")
-    p.add_argument("--model", default=os.environ.get("HAI_MODEL_NAME", DEFAULT_MODEL))
-    p.add_argument("--base-url", default=os.environ.get("HAI_MODEL_URL", DEFAULT_BASE_URL))
-    p.add_argument("--api-key", default=os.environ.get("HAI_API_KEY"))
-    p.add_argument("--dry-run", action="store_true", help="localize but do not click/type/press")
-    p.add_argument("--save", metavar="PATH", help="save the annotated screenshot here")
-    p.add_argument("--list-windows", action="store_true")
-    p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--right-click", action="store_true", help="right-click instead of left-click")
-    p.add_argument("--double-click", action="store_true", help="double-click instead of single")
-    p.add_argument("--type", dest="type_text", metavar="TEXT", help="after clicking, type this text")
-    p.add_argument("--press", metavar="KEY[+mods]", help="press a key chord, e.g. 'ctrl+s' or 'f5'")
-    args = p.parse_args()
-
-    if args.list_windows:
-        for hwnd, title in list_windows():
-            print(f"0x{hwnd:08x}  {title}")
-        return 0
-
-    # --press without a description: just send the key chord, no window focus.
-    if args.press and not args.description:
-        parts = [p_.strip() for p_ in args.press.split("+") if p_.strip()]
-        if not parts:
-            p.error("--press value is empty")
-        key = parts[-1]
-        mods = parts[:-1]
-        if args.dry_run:
-            print(f"dry-run: would press {'+'.join(mods + [key]) if mods else key}")
-            return 0
-        press_key(key, modifiers=mods or None)
-        print(f"pressed {'+'.join(mods + [key]) if mods else key}")
-        return 0
-
-    if not args.description:
-        p.error("description is required unless --list-windows or --press")
-    if not args.api_key:
-        p.error("HAI_API_KEY not set (env, .env, or --api-key)")
-
-    hwnd, title = find_window(args.window_title)
-    print(f"window: {title}")
-
-    image, (win_left, win_top) = capture(hwnd)
-    print(f"captured {image.width}x{image.height} at screen ({win_left},{win_top})")
-
-    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
-    x, y = localize(client, args.model, image, args.description, args.temperature)
-    screen_x, screen_y = win_left + x, win_top + y
-    print(f"localized: window ({x},{y}) -> screen ({screen_x},{screen_y})")
-
-    if args.save:
-        from PIL import ImageDraw
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        draw.line([(x - 15, y), (x + 15, y)], fill="red", width=3)
-        draw.line([(x, y - 15), (x, y + 15)], fill="red", width=3)
-        draw.ellipse([x - 10, y - 10, x + 10, y + 10], outline="red", width=2)
-        annotated.save(args.save)
-        print(f"saved annotated screenshot to {args.save}")
-
-    if args.dry_run:
-        print("dry-run: skipping click and any follow-up text/key action")
-        return 0
-
-    print("clicking in 1s (Ctrl+C to cancel)...")
-    time.sleep(1.0)
-    if args.right_click:
-        right_click_at(screen_x, screen_y)
-        print("right-clicked.")
-    elif args.double_click:
-        double_click_at(screen_x, screen_y)
-        print("double-clicked.")
-    else:
-        click_at(screen_x, screen_y)
-        print("clicked.")
-
-    if args.type_text:
-        time.sleep(0.1)
-        send_text(args.type_text)
-        print(f"typed {len(args.type_text)} chars.")
-
-    if args.press:
-        parts = [p_.strip() for p_ in args.press.split("+") if p_.strip()]
-        if parts:
-            key = parts[-1]
-            mods = parts[:-1]
-            time.sleep(0.05)
-            press_key(key, modifiers=mods or None)
-            print(f"pressed {'+'.join(mods + [key]) if mods else key}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
