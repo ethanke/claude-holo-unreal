@@ -70,4 +70,4 @@ where = ["."]
 include = ["holo_unreal*"]
 
 [tool.setuptools.package-data]
-holo_unreal = ["py.typed"]
+holo_unreal = ["py.typed", "skills/**/*.md"]

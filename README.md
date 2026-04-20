@@ -73,6 +73,29 @@ After install, these commands are on `$PATH`:
 
 ---
 
+## One-shot bootstrap
+
+```bash
+hue claude
+```
+
+That's it. `hue claude` installs the two shipped skills into `~/.claude/skills/`, registers the MCP server in `claude`'s user-scope config (if it isn't already), checks your `HAI_API_KEY`, then hands off to the `claude` CLI so you land straight in a Claude Code session with `unreal-toolkit` + `unreal-vision` + `ue_*` MCP tools ready.
+
+Idempotent — safe to run repeatedly. Use `--force` to reinstall skills and re-register the MCP server.
+
+```bash
+hue claude                     # bootstrap + launch
+hue claude -- --continue       # pass args through to `claude`
+hue claude --force             # reinstall skills, re-register MCP, then launch
+hue claude --no-mcp            # skip MCP registration step
+hue claude --no-skills         # skip skill install step
+hue claude --scope project     # register MCP at project scope instead of user
+
+hue setup                      # same bootstrap without launching
+```
+
+---
+
 ## Quickstart — three common flows
 
 ### 1. UE toolkit from the shell
@@ -137,12 +160,23 @@ Every vision command is JSON on stdout and prints coordinates so you can feed th
 
 ### 3. From inside Claude Code (MCP + skills)
 
+One command:
+
+```bash
+hue claude                     # setup + launch
+```
+
+Or manually, if you prefer step-by-step:
+
 ```bash
 # Copy the shipped skills into ~/.claude/skills/
 hue skills install
 
-# Register the MCP server (restart Claude Code afterwards)
+# Register the MCP server
 claude mcp add -s user holo-unreal -- python -m holo_unreal.mcp_server
+
+# Launch Claude Code
+claude
 ```
 
 Once registered, Claude Code has these MCP tools available:
@@ -276,7 +310,7 @@ claude-holo-unreal/
 │   ├── scenarios.py         # curated UE test scenarios
 │   ├── mcp_server.py        # FastMCP stdio server
 │   └── _env.py              # .env loader + defaults
-├── skills/
+├── holo_unreal/skills/
 │   ├── unreal-toolkit/SKILL.md
 │   └── unreal-vision/SKILL.md
 ├── examples/                # editor-side Python scripts

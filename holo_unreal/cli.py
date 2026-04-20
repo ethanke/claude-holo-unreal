@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -260,26 +261,222 @@ def _cmd_mcp(a) -> None:
     mcp_main()
 
 
-def _cmd_skills_install(a) -> None:
-    target = Path(a.target).expanduser().resolve()
+def _shipped_skills_dir() -> Path | None:
+    """Locate the shipped skills directory — works for both pip-installed wheels
+    and editable source checkouts."""
+    # Preferred: bundled inside the package (works after `pip install`).
+    inside = Path(__file__).resolve().parent / "skills"
+    if inside.is_dir():
+        return inside
+    # Fallback: legacy repo-root layout (old clones).
+    outside = Path(__file__).resolve().parent.parent / "skills"
+    if outside.is_dir():
+        return outside
+    return None
+
+
+def _install_skills(target: Path, *, force: bool) -> dict:
     target.mkdir(parents=True, exist_ok=True)
-    src_root = Path(__file__).resolve().parent.parent / "skills"
-    if not src_root.is_dir():
-        _fail(f"shipped skills dir not found: {src_root}")
+    src_root = _shipped_skills_dir()
+    if src_root is None:
+        return {
+            "ok": False,
+            "error": "shipped skills dir not found",
+            "target": str(target),
+        }
     installed: list[str] = []
     skipped: list[str] = []
     for skill_dir in sorted(src_root.iterdir()):
         if not skill_dir.is_dir():
             continue
         dest = target / skill_dir.name
-        if dest.exists() and not a.force:
+        if dest.exists() and not force:
             skipped.append(str(dest))
             continue
-        if dest.exists() and a.force:
+        if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(skill_dir, dest)
         installed.append(str(dest))
-    _emit({"ok": True, "installed": installed, "skipped": skipped, "target": str(target)})
+    return {
+        "ok": True,
+        "installed": installed,
+        "skipped": skipped,
+        "target": str(target),
+        "source": str(src_root),
+    }
+
+
+def _cmd_skills_install(a) -> None:
+    target = Path(a.target).expanduser().resolve()
+    _emit(_install_skills(target, force=a.force))
+
+
+def _find_claude_cli() -> str | None:
+    """Locate the Claude Code CLI on PATH, including the common ~/.local/bin
+    and %APPDATA%\\npm fallback locations shells sometimes miss."""
+    exe = shutil.which("claude")
+    if exe:
+        return exe
+    candidates = [
+        Path.home() / ".local" / "bin" / "claude",
+        Path.home() / ".local" / "bin" / "claude.exe",
+        Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+MCP_SERVER_NAME = "holo-unreal"
+
+
+def _mcp_is_registered(claude_exe: str) -> bool:
+    try:
+        r = subprocess.run(
+            [claude_exe, "mcp", "list"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return False
+    out = (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        if line.strip().startswith(f"{MCP_SERVER_NAME}:") or line.strip().startswith(f"{MCP_SERVER_NAME} "):
+            return True
+    return False
+
+
+def _register_mcp(claude_exe: str, *, scope: str, force: bool) -> dict:
+    existed = _mcp_is_registered(claude_exe)
+    if existed and not force:
+        return {"ok": True, "status": "already-registered", "name": MCP_SERVER_NAME}
+    if existed and force:
+        subprocess.run(
+            [claude_exe, "mcp", "remove", MCP_SERVER_NAME],
+            capture_output=True, text=True,
+        )
+    cmd = [
+        claude_exe, "mcp", "add", "-s", scope, MCP_SERVER_NAME,
+        "--", sys.executable, "-m", "holo_unreal.mcp_server",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return {
+            "ok": False,
+            "status": "add-failed",
+            "returncode": r.returncode,
+            "stderr": r.stderr.strip(),
+            "cmd": cmd,
+        }
+    return {
+        "ok": True,
+        "status": "registered",
+        "name": MCP_SERVER_NAME,
+        "scope": scope,
+        "command": f"{sys.executable} -m holo_unreal.mcp_server",
+    }
+
+
+def _bootstrap(*, scope: str, skip_skills: bool, skip_mcp: bool, force: bool) -> dict:
+    load_env()
+    report: dict = {
+        "ok": True,
+        "version": __version__,
+        "hai_api_key_set": bool(hai_api_key()),
+        "default_project": default_project(),
+    }
+
+    if not skip_skills:
+        target = Path.home() / ".claude" / "skills"
+        report["skills"] = _install_skills(target, force=force)
+        if not report["skills"]["ok"]:
+            report["ok"] = False
+
+    claude_exe = _find_claude_cli()
+    report["claude_cli"] = claude_exe
+
+    if not skip_mcp:
+        if claude_exe is None:
+            report["mcp"] = {
+                "ok": False,
+                "status": "claude-not-found",
+                "hint": "Install Claude Code from https://claude.com/claude-code",
+            }
+            report["ok"] = False
+        else:
+            report["mcp"] = _register_mcp(claude_exe, scope=scope, force=force)
+            if not report["mcp"]["ok"]:
+                report["ok"] = False
+
+    return report
+
+
+def _cmd_setup(a) -> None:
+    """Install skills + register MCP; don't launch Claude Code."""
+    report = _bootstrap(
+        scope=a.scope,
+        skip_skills=a.no_skills,
+        skip_mcp=a.no_mcp,
+        force=a.force,
+    )
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(1)
+
+
+def _cmd_claude(a) -> None:
+    """Set up skills + MCP, then exec the Claude Code CLI."""
+    # Bootstrap (logs human-readable status lines to stderr, then one JSON
+    # summary before handing off).
+    report = _bootstrap(
+        scope=a.scope,
+        skip_skills=a.no_skills,
+        skip_mcp=a.no_mcp,
+        force=a.force,
+    )
+
+    # Pretty-print bootstrap status to stderr so stdout stays clean for `claude`.
+    def _say(msg: str) -> None:
+        print(f"[holo-unreal] {msg}", file=sys.stderr)
+
+    _say(f"version {report['version']}  |  HAI_API_KEY {'set' if report['hai_api_key_set'] else 'MISSING'}")
+    skills = report.get("skills")
+    if skills:
+        if skills["ok"]:
+            if skills["installed"]:
+                _say(f"installed skills: {', '.join(Path(p).name for p in skills['installed'])}")
+            if skills["skipped"]:
+                _say(f"skills already present: {', '.join(Path(p).name for p in skills['skipped'])}")
+        else:
+            _say(f"skills install FAILED: {skills.get('error')}")
+    mcp = report.get("mcp")
+    if mcp:
+        if mcp["ok"]:
+            _say(f"MCP server 'holo-unreal': {mcp['status']}")
+        else:
+            _say(f"MCP setup FAILED ({mcp.get('status')}): {mcp.get('stderr') or mcp.get('hint')}")
+
+    claude_exe = report.get("claude_cli")
+    if claude_exe is None:
+        _fail(
+            "Claude Code CLI not found on PATH. Install from https://claude.com/claude-code, "
+            "then re-run `hue claude`."
+        )
+
+    if not report["hai_api_key_set"]:
+        _say(
+            "WARNING: HAI_API_KEY not set — ue_click/ue_locate/ue_type will error. "
+            "Put it in .env or export it before using vision tools."
+        )
+
+    # Launch claude, inheriting the current terminal (interactive session).
+    extra = a.extra or []
+    _say(f"launching: {claude_exe} {' '.join(extra)}")
+    try:
+        r = subprocess.run([claude_exe, *extra])
+    except KeyboardInterrupt:
+        sys.exit(130)
+    sys.exit(r.returncode)
 
 
 def _cmd_info(a) -> None:
@@ -291,6 +488,8 @@ def _cmd_info(a) -> None:
         "default_project": default_project(),
         "python": sys.version.split()[0],
         "platform": sys.platform,
+        "claude_cli": _find_claude_cli(),
+        "shipped_skills_dir": str(_shipped_skills_dir()) if _shipped_skills_dir() else None,
     })
 
 
@@ -453,6 +652,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--force", action="store_true", help="overwrite existing skill dirs")
     s.set_defaults(func=_cmd_skills_install)
+
+    # One-shot bootstrap: install skills + register MCP + launch Claude Code.
+    s = sp.add_parser(
+        "claude",
+        help="install skills + register MCP server, then launch Claude Code",
+    )
+    s.add_argument("--scope", default="user", choices=["user", "project", "local"],
+                   help="MCP server scope (default: user)")
+    s.add_argument("--no-skills", action="store_true",
+                   help="skip skill install step")
+    s.add_argument("--no-mcp", action="store_true",
+                   help="skip MCP server registration step")
+    s.add_argument("--force", action="store_true",
+                   help="re-install skills and re-register MCP even if already present")
+    s.add_argument("extra", nargs=argparse.REMAINDER,
+                   help="extra args passed through to `claude` (use -- to separate)")
+    s.set_defaults(func=_cmd_claude)
+
+    s = sp.add_parser(
+        "setup",
+        help="install skills + register MCP server (no launch)",
+    )
+    s.add_argument("--scope", default="user", choices=["user", "project", "local"])
+    s.add_argument("--no-skills", action="store_true")
+    s.add_argument("--no-mcp", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=_cmd_setup)
 
     s = sp.add_parser("info", help="package version + backend keys")
     s.set_defaults(func=_cmd_info)
