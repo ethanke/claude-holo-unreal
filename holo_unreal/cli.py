@@ -470,7 +470,10 @@ def _cmd_claude(a) -> None:
         )
 
     # Launch claude, inheriting the current terminal (interactive session).
-    extra = a.extra or []
+    # Strip any leading `--` separator the argv normalizer may have injected.
+    extra = list(a.extra or [])
+    if extra and extra[0] == "--":
+        extra = extra[1:]
     _say(f"launching: {claude_exe} {' '.join(extra)}")
     try:
         r = subprocess.run([claude_exe, *extra])
@@ -686,12 +689,90 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+KNOWN_SUBCOMMANDS = {
+    "ue", "list-windows", "locate", "click", "right-click", "double-click",
+    "type", "press", "focus", "mcp", "skills", "claude", "setup", "info",
+}
+TOP_LEVEL_OPTIONS = {"-h", "--help", "--version"}
+
+# Flags the `claude` subcommand owns itself (vs. pass-through to Claude Code).
+_CLAUDE_OWN_FLAGS_WITH_ARG = {"--scope"}
+_CLAUDE_OWN_FLAGS_BOOL = {"--no-skills", "--no-mcp", "--force"}
+
+
+def _shorthand_claude(argv: list[str]) -> int:
+    """Route bare args straight to `claude` with defaults for our own flags.
+
+    Makes `python -m holo_unreal` and `python -m holo_unreal --foo` both work:
+    the former launches a plain Claude Code session, the latter passes `--foo`
+    through to `claude`.
+    """
+    class _NS:
+        scope = "user"
+        no_skills = False
+        no_mcp = False
+        force = False
+
+    ns = _NS()
+    ns.extra = list(argv)
+    _cmd_claude(ns)
+    return 0
+
+
+def _normalize_claude_argv(argv: list[str]) -> list[str]:
+    """For explicit `claude` subcommand: split our flags from Claude Code
+    pass-through so argparse's REMAINDER works correctly.
+
+    Example:
+        ["claude", "--force", "--dangerously-skip-permissions"]
+      → ["claude", "--force", "--", "--dangerously-skip-permissions"]
+    """
+    rest = argv[1:]
+    our: list[str] = []
+    passthrough: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("--help", "-h"):
+            our.append(tok)
+            i += 1
+        elif tok == "--":
+            passthrough.extend(rest[i + 1:])
+            break
+        elif tok in _CLAUDE_OWN_FLAGS_WITH_ARG:
+            if i + 1 < len(rest):
+                our.extend([tok, rest[i + 1]])
+                i += 2
+            else:
+                our.append(tok)
+                i += 1
+        elif tok in _CLAUDE_OWN_FLAGS_BOOL:
+            our.append(tok)
+            i += 1
+        else:
+            # Anything else → pass-through to Claude Code (stop parsing ours).
+            passthrough.extend(rest[i:])
+            break
+    if passthrough:
+        return ["claude"] + our + ["--"] + passthrough
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    # Bare `hue` / `python -m holo_unreal` → one-shot bootstrap + launch.
+
+    # Bare invocation or unknown first token → treat as `claude` shorthand.
     if not argv:
-        argv = ["claude"]
+        return _shorthand_claude([])
+    if argv[0] not in KNOWN_SUBCOMMANDS and argv[0] not in TOP_LEVEL_OPTIONS:
+        return _shorthand_claude(argv)
+
+    # Explicit `claude` subcommand: split our flags from pass-through before
+    # argparse sees them (REMAINDER doesn't capture bare flags).
+    if argv[0] == "claude":
+        argv = _normalize_claude_argv(argv)
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
